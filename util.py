@@ -56,3 +56,12 @@ def get_func_code(func):
         return func.func_code
     elif version_info.major == 3:
         return func.__code__
+
+BaseHTTPRequestHandler = None
+HTTPServer = None
+if version_info.major == 3:
+    from http.server import BaseHTTPRequestHandler as BaseHTTPRequestHandler
+    from http.server import HTTPServer as HTTPServer
+else:
+    from BaseHTTPServer import BaseHTTPRequestHandler as BaseHTTPRequestHandler
+    from BaseHTTPServer import HTTPServer

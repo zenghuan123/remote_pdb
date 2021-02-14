@@ -1,5 +1,6 @@
 # coding=utf-8
 import functools
+import logging
 import time
 import pdb
 import sys
@@ -8,19 +9,21 @@ import util
 from threading import RLock
 from net import RpcHandler
 
-from net import LoopThread, Server
+from net import LoopThread, Server,HttpServerAsyn
 
 debugger = None
-host = "0.0.0.0"
-port = 55555
+__ip = None
+__port = None
 __socket_fd = None
 __w = None  # type: socket.socket
 __r =None 	# type: socket.socket
 __lock = RLock()
 __server = None
 __loop = None
-__handler_class = None
-
+__handler = None
+__http_port = None
+__http_server = None
+__logger = None
 
 def message_call_back(con, obj):
 	if not debugger:
@@ -30,45 +33,57 @@ def message_call_back(con, obj):
 
 def new_connection(con):
 	con.message_callback = message_call_back
-	if callable(__handler_class):
-		debugger.handler = __handler_class(debugger,con)
+	rpc = RpcHandler(con, __handler)
+
+
+class HttpHandlerWrap(object):
+	def __getattr__(self, item):
+		return getattr(debugger.handler,item,None)
 
 
 def server_init_call_back(ip, port,loop):
 	global __server
+	global __http_server
 	__server = Server(ip, port)
 	__server.close_callback = client_close
 	__server.connection_callback = new_connection
-
+	__logger.info("server init")
+	if __http_port:
+		__http_server = HttpServerAsyn(ip, __http_port, __handler)
 
 def client_close(con):
-	if debugger and debugger.handler and debugger.handler.con is con:
-		print("client close")
-		debugger.handler.con = None
-		debugger.handler = None
+	if debugger:
 		send_command("c")
 
 
-def start_debugger(ip, port, handler_class):
+def start_debugger(ip, port, handler, http_port=None):
 	global debugger
 	if debugger:
-		return
-	if not issubclass(handler_class,RpcHandler):
 		return
 	global __socket_fd
 	global __w
 	global __r
 	global __loop
-	global __handler_class
+	global __handler
+	global __http_port
+	global __http_server
+	global __ip
+	global __port
+	global __logger
+
+	__ip = ip
+	__port = port
+	__http_port = http_port
 	__w, __r = util.socketpair()
 	__socket_fd = __r.makefile("rw")
 	debugger = RemotePdb(__socket_fd)
-	__handler_class = handler_class
+	__handler = handler
 	code = util.get_func_code(__just_break)
 	funcname = code.co_name
 	lineno = code.co_firstlineno
 	filename = code.co_filename
 	debugger.set_break(filename, lineno, 0, None, funcname)
+	__logger = logging.getLogger("debugger")
 	th = LoopThread()
 	th.set_init_call_back(functools.partial(server_init_call_back, ip, port))
 	__loop = th.start_loop()
@@ -91,7 +106,6 @@ def send_command(cmd, *args):
 
 class RemotePdb(pdb.Pdb):
 	def __init__(self, fd):
-
 		pdb.Pdb.__init__(self, completekey="tag", stdin=fd, stdout=fd, skip=["bdb", "pdb", "linecache", "RemotePdb"])
 		self.fd = fd		# io
 		self.handler = None
@@ -118,7 +132,9 @@ class RemotePdb(pdb.Pdb):
 		return self.do_continue(arg)
 
 	def stop_here(self, frame):
-		return pdb.Pdb.stop_here(self,frame)
+		b = pdb.Pdb.stop_here(self, frame)
+		if self.handler:
+			return b or self.handler.stop_here(frame)
 
 	def break_here(self, frame):
 		b = pdb.Pdb.break_here(self, frame)
@@ -148,14 +164,12 @@ def set_trace():
 		pass
 
 
-class PdbHandler(RpcHandler):
-	def __init__(self, deb, con):
-		super(PdbHandler, self).__init__(con)
-		self.debugger = deb
-		self.con = con
+class BaseRemoteDebugger(object):
+	def __init__(self):
+		self.logger = logging.getLogger(self.__class__.__name__)
 
-	def break_here(self, frame):
-		return False
+	def call(self,method_name,*args,**kwargs):
+		pass
 
 	def step_run(self):
 		# 单步调试
@@ -182,7 +196,7 @@ def test():
 
 
 if __name__ == '__main__':
-	start_debugger("127.0.0.1", 5555,PdbHandler)
+	start_debugger("127.0.0.1", 5555,BaseRemoteDebugger())
 	while True:
 		time.sleep(1)
 		test()

@@ -1,12 +1,14 @@
 # coding=utf-8
+
 import asyncore
 import functools
+import logging
 import threading
 import time
 import struct
 import json
 import socket
-from util import socketpair
+from util import socketpair,BaseHTTPRequestHandler,HTTPServer
 
 header_len = 4
 header_fmt = ">I"
@@ -20,6 +22,9 @@ class RpcHandler(object):
 		self.handler = handler
 		if self.handler:
 			self.handler.call = self.call
+
+		if hasattr(self.handler,"on_connect"):
+			self.handler.on_connect()
 
 	def message_call_back(self, con, obj):
 		self.rpc_method(obj)
@@ -80,7 +85,7 @@ class Connection(asyncore.dispatcher_with_send):
 		return asyncore.dispatcher_with_send.send(self, i)
 
 	def handle_close(self):
-		super(Connection, self).handle_close()
+		asyncore.dispatcher_with_send.handle_close(self)
 		if self.on_close:
 			self.on_close()
 
@@ -92,7 +97,7 @@ class Server(asyncore.dispatcher):
 		self.set_reuse_addr()
 		self.bind((ip, port))
 		self.listen(100)
-
+		self.logger = logging.getLogger(self.__class__.__name__)
 		self.connection_callback = None
 		self.close_callback = None
 
@@ -100,26 +105,29 @@ class Server(asyncore.dispatcher):
 		pair = self.accept()
 		if pair is not None:
 			sock, addr = pair
+			self.logger.debug("accept %s",addr)
 			con = Connection(sock)
-			if self.close_callback:
-				con.handle_close = functools.partial(self.close_callback, con)
+			con.on_close = functools.partial(self.connection_close, con)
 			self.connection_callback(con)
 
+	def connection_close(self, con):
+		if self.close_callback:
+			self.close_callback(con)
 
 class Client(Connection):
 	def __init__(self, ip, port, sock=None, map=None):
 		Connection.__init__(self, sock=sock, map=map)
 		self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
 		self.connect((ip, port))
+		self.logger = logging.getLogger(self.__class__.__name__)
 
 	def handle_connect(self):
-		super(Client, self).handle_connect()
-		pass
+		self.logger.debug("connect success")
+		Connection.handle_connect(self)
 
 	def handle_close(self):
-		super(Client, self).handle_close()
-		# TODO reconnect
-		print("to do reconnect")
+		self.logger.debug("close")
+		Connection.handle_close(self)
 
 
 class WakeUp(asyncore.dispatcher):
@@ -135,6 +143,75 @@ class WakeUp(asyncore.dispatcher):
 		for func in self.func_array:
 			func()
 		self.func_array = []
+
+
+class HttpResquest(BaseHTTPRequestHandler):
+	def do_POST(self):
+		try:
+			data = self.rfile.read(int(self.headers['content-length']))
+			if hasattr(self.server, "handler"):
+				method_name = self.path[1:]
+				data = data.decode('utf-8')
+				request_data = json.loads(data)
+				method = getattr(self.server.handler, method_name,None)
+				response_data = method(**request_data)
+				data = json.dumps(response_data)
+				self.send_response(200)
+				self.send_header('Content-type', 'application/json')
+				self.end_headers()
+				self.wfile.write(data.encode('utf-8'))
+				return
+		except Exception or BaseException:
+			import traceback
+			logging.getLogger(self.__class__.__name__).error(traceback.format_exc(10))
+		self.send_response(404, "not method")
+		self.send_header('Content-type', 'application/json')
+		self.end_headers()
+		self.wfile.write("not method")
+
+
+class HttpConnection(asyncore.dispatcher_with_send):
+	def __init__(self,handler,sock=None, map=None):
+		self.handler = handler
+		asyncore.dispatcher_with_send.__init__(self, sock=sock, map=map)
+
+	def handle_read(self):
+		request = HttpResquest(self.socket, self.addr, self)
+		# request.close()
+		self.close()
+
+
+class HttpServerAsyn(asyncore.dispatcher):
+	def __init__(self, ip, port, handler=None, map=None):
+		self.handler = handler
+		asyncore.dispatcher.__init__(self, sock=None, map=map)
+		self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+		self.set_reuse_addr()
+		self.bind((ip, port))
+		self.listen(100)
+
+		# self.http_server = HTTPServer((ip, port), HttpResquest)
+		# asyncore.dispatcher.__init__(self, sock=self.http_server.socket, map=map)
+		# self.http_server.handler = handler
+		# self.set_reuse_addr()
+		# self.addr = (ip, port)
+		#
+		# #self.bind((ip, port))
+		# self.listen(100)
+		self.logger = logging.getLogger(self.__class__.__name__)
+		self.logger.info("http server start on port %s", port)
+
+	def handle_accept(self):
+		# 感觉不太好
+		# self.http_server._handle_request_noblock()
+		pair = self.accept()
+		if pair is not None:
+			sock, addr = pair
+			con = HttpConnection(self.handler,sock=sock)
+
+
+	def handle_close(self):
+		pass
 
 
 class Loop(object):
