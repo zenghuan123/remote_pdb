@@ -1,6 +1,7 @@
 # coding=utf-8
 import functools
 import logging
+import os
 import time
 import pdb
 import sys
@@ -11,7 +12,7 @@ from net import RpcHandler
 
 from net import LoopThread, Server,HttpServerAsyn
 
-debugger = None
+__pdb = None
 __ip = None
 __port = None
 __socket_fd = None
@@ -20,25 +21,22 @@ __r =None 	# type: socket.socket
 __lock = RLock()
 __server = None
 __loop = None
-__handler = None
+debugger = None
 __http_port = None
 __http_server = None
 __logger = None
 
-def message_call_back(con, obj):
-	if not debugger:
-		return
-	debugger.handler.rpc_method(obj)
-
+def get_pdb():
+	return __pdb
 
 def new_connection(con):
-	con.message_callback = message_call_back
-	rpc = RpcHandler(con, __handler)
+	__pdb.handler = RpcHandler(con, debugger)
 
 
 class HttpHandlerWrap(object):
 	def __getattr__(self, item):
-		return getattr(debugger.handler,item,None)
+		global __pdb
+		return getattr(__pdb.handler, item, None)
 
 
 def server_init_call_back(ip, port,loop):
@@ -48,23 +46,26 @@ def server_init_call_back(ip, port,loop):
 	__server.close_callback = client_close
 	__server.connection_callback = new_connection
 	__logger.info("server init")
+	# io线程初始化好之后通知 被调试的线程开始继续跑
+	time.sleep(2)
+	send_command("c")
 	if __http_port:
-		__http_server = HttpServerAsyn(ip, __http_port, __handler)
+		__http_server = HttpServerAsyn(ip, __http_port, debugger)
 
 def client_close(con):
-	if debugger:
-		send_command("c")
+	if __pdb and __pdb.handler.con is con:
+		__pdb.set_quit()
 
 
-def start_debugger(ip, port, handler, http_port=None):
-	global debugger
-	if debugger:
+def start_debugger(ip, port, de, http_port=None):
+	global __pdb
+	if __pdb:
 		return
 	global __socket_fd
 	global __w
 	global __r
 	global __loop
-	global __handler
+	global debugger
 	global __http_port
 	global __http_server
 	global __ip
@@ -76,21 +77,15 @@ def start_debugger(ip, port, handler, http_port=None):
 	__http_port = http_port
 	__w, __r = util.socketpair()
 	__socket_fd = __r.makefile("rw")
-	debugger = RemotePdb(__socket_fd)
-	__handler = handler
-	code = util.get_func_code(__just_break)
-	funcname = code.co_name
-	lineno = code.co_firstlineno
-	filename = code.co_filename
-	debugger.set_break(filename, lineno, 0, None, funcname)
+	__pdb = RemotePdb(__socket_fd)
+	debugger = de
 	__logger = logging.getLogger("debugger")
 	th = LoopThread()
 	th.set_init_call_back(functools.partial(server_init_call_back, ip, port))
 	__loop = th.start_loop()
+	# 把被调试的线程卡住
+	__pdb.set_trace()
 
-
-def __just_break():
-	pass
 
 
 def send_command(cmd, *args):
@@ -103,12 +98,21 @@ def send_command(cmd, *args):
 	__w.send(s)
 	__lock.release()
 
-
+this_path = os.path.dirname(__file__)
 class RemotePdb(pdb.Pdb):
 	def __init__(self, fd):
 		pdb.Pdb.__init__(self, completekey="tag", stdin=fd, stdout=fd, skip=["bdb", "pdb", "linecache", "RemotePdb"])
 		self.fd = fd		# io
 		self.handler = None
+		try:
+			rcFile = open(os.path.join(this_path, ".pdbrc"))
+		except IOError:
+			pass
+		else:
+			for line in rcFile.readlines():
+				self.rcLines.append(line)
+			rcFile.close()
+
 
 	def cmdloop(self, intro=None):
 		return pdb.Pdb.cmdloop(self, intro)
@@ -131,15 +135,17 @@ class RemotePdb(pdb.Pdb):
 		# print "debug do_quit",os.getpid()
 		return self.do_continue(arg)
 
-	def stop_here(self, frame):
-		b = pdb.Pdb.stop_here(self, frame)
-		if self.handler:
-			return b or self.handler.stop_here(frame)
-
-	def break_here(self, frame):
-		b = pdb.Pdb.break_here(self, frame)
-		if self.handler:
-			return b or self.handler.break_here(frame)
+	# def stop_here(self, frame):
+	# 	print("debug stop_here")
+	# 	b = pdb.Pdb.stop_here(self, frame)
+	# 	if self.handler:
+	# 		return b or self.handler.stop_here(frame)
+	#
+	# def break_here(self, frame):
+	# 	print("debug break_here")
+	# 	b = pdb.Pdb.break_here(self, frame)
+	# 	if self.handler:
+	# 		return b or self.handler.break_here(frame)
 
 	do_q = do_quit
 
@@ -149,15 +155,15 @@ class RemotePdb(pdb.Pdb):
 
 
 def set_trace():
-	global debugger
+	global __pdb
 	global socket_fd
-	if not debugger:
+	if not __pdb:
 		return
-	if not debugger.handler:
+	if not __pdb.handler:
 		return
 	try:
 		frame = sys._getframe().f_back
-		debugger.set_trace(frame)
+		__pdb.set_trace(frame)
 	except:
 		pass
 	finally:
